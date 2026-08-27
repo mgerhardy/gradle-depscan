@@ -125,7 +125,7 @@ The final report classifies each vulnerability as:
 
 ## Requirements
 
-- Gradle 7.0+
+- Gradle 8.0+
 - Java 17+
 - Linux or macOS (amd64 or arm64)
 
