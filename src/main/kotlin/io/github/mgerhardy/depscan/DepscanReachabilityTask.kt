@@ -68,7 +68,8 @@ abstract class DepscanReachabilityTask @Inject constructor(
 
         val artifacts = findArtifacts()
         if (artifacts.isEmpty()) {
-            logger.warn("No scannable artifacts found. Run 'assemble' first.")
+            logger.warn("No scannable artifacts found.")
+            logger.warn("In a composite build, run: ./gradlew assemble depscanReachability")
             return
         }
 
@@ -163,8 +164,15 @@ abstract class DepscanReachabilityTask @Inject constructor(
         }
 
         // Step 4: Collect runtime deps for test-scope filtering
-        val runtimeDeps = if (!includeTestDependencies.get() && javaProjects.isPresent) {
-            RuntimeDependencyResolver.collectRuntimeDeps(javaProjects.get(), logger)
+        val runtimeDeps = if (!includeTestDependencies.get()) {
+            if (javaProjects.isPresent && javaProjects.get().isNotEmpty()) {
+                // Regular multi-project build: resolve directly from Project objects
+                RuntimeDependencyResolver.collectRuntimeDeps(javaProjects.get(), logger)
+            } else {
+                // Composite build: resolve from runtime-deps.txt files
+                val deps = RuntimeDependencyResolver.collectRuntimeDepsFromFiles(artifactDirs.get(), logger)
+                deps.ifEmpty { null }
+            }
         } else {
             null
         }

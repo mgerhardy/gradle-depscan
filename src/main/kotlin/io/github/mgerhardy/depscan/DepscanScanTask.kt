@@ -53,7 +53,8 @@ abstract class DepscanScanTask @Inject constructor(
 
         val artifacts = findArtifacts()
         if (artifacts.isEmpty()) {
-            logger.warn("No scannable artifacts found in any subproject build/libs/ directory")
+            logger.warn("No scannable artifacts found in any subproject build/libs/ directory.")
+            logger.warn("In a composite build, run: ./gradlew assemble depscanScan")
             return
         }
 

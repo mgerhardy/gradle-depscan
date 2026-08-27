@@ -25,6 +25,8 @@ class DepscanPlugin : Plugin<Project> {
         val binaryFile = effectiveInstallDir.map { it.file(DepscanDownloadTask.binaryName()) }
         val effectiveBinary = extension.binaryPath.orElse(binaryFile)
 
+        val isCompositeBuild = project.gradle.includedBuilds.isNotEmpty()
+
         // Discover Java subprojects (lazily)
         val javaSubprojects = project.provider {
             val excludes = extension.excludeProjects.get().toSet()
@@ -33,10 +35,17 @@ class DepscanPlugin : Plugin<Project> {
             }.toList()
         }
 
-        // Collect artifact directories from subprojects
-        val artifactDirs = javaSubprojects.map { subs ->
-            subs.map { sub ->
-                File(sub.layout.buildDirectory.get().asFile, "libs").absolutePath
+        // Collect artifact directories -- supports both regular and composite builds
+        val artifactDirs = if (isCompositeBuild) {
+            project.provider {
+                val excludes = extension.excludeProjects.get().toSet()
+                discoverCompositeBuildArtifactDirs(project, excludes)
+            }
+        } else {
+            javaSubprojects.map { subs ->
+                subs.map { sub ->
+                    File(sub.layout.buildDirectory.get().asFile, "libs").absolutePath
+                }
             }
         }
 
@@ -77,7 +86,10 @@ class DepscanPlugin : Plugin<Project> {
             it.reportsDir.set(extension.reportsDir)
             it.vdbHome.set(extension.vdbHome.map { it.asFile.absolutePath })
             it.artifactDirs.set(artifactDirs)
-            it.javaProjects.set(javaSubprojects)
+            // Only set javaProjects for non-composite builds (composite uses file-based resolution)
+            if (!isCompositeBuild) {
+                it.javaProjects.set(javaSubprojects)
+            }
         }
 
         project.tasks.register("depscanFullScan") {
@@ -86,15 +98,57 @@ class DepscanPlugin : Plugin<Project> {
             it.dependsOn(reachabilityTask)
         }
 
-        // Wire assemble dependency after evaluation (subprojects may not have java plugin yet)
-        project.afterEvaluate {
-            val assembleTasks = javaSubprojects.get().mapNotNull { sub ->
-                sub.tasks.findByName("assemble")
+        // Wire assemble dependencies
+        if (isCompositeBuild) {
+            // Composite build: no task dependency on included builds' assemble.
+            // Gradle does not support dependsOn or shouldRunAfter across the
+            // composite boundary. The scan tasks simply scan whatever artifacts
+            // are already built on disk. In CI, assemble runs before depscan
+            // as a separate Gradle invocation.
+            project.logger.info("Depscan: composite build detected -- scan will use pre-built artifacts")
+        } else {
+            // Regular build: depend on subproject assemble tasks
+            project.afterEvaluate {
+                val assembleTasks = javaSubprojects.get().mapNotNull { sub ->
+                    sub.tasks.findByName("assemble")
+                }
+                if (assembleTasks.isNotEmpty()) {
+                    scanTask.configure { task -> assembleTasks.forEach { task.dependsOn(it) } }
+                    reachabilityTask.configure { task -> assembleTasks.forEach { task.dependsOn(it) } }
+                }
             }
-            if (assembleTasks.isNotEmpty()) {
-                scanTask.configure { task -> assembleTasks.forEach { task.dependsOn(it) } }
-                reachabilityTask.configure { task -> assembleTasks.forEach { task.dependsOn(it) } }
+        }
+    }
+
+    companion object {
+        /**
+         * Discovers build/libs directories across all included builds in a composite.
+         *
+         * Walks each included build's project directory looking for build/libs/ directories
+         * that contain scannable artifacts (boot WARs, JARs).
+         */
+        fun discoverCompositeBuildArtifactDirs(project: Project, excludes: Set<String>): List<String> {
+            val dirs = mutableListOf<String>()
+            for (included in project.gradle.includedBuilds) {
+                if (included.name in excludes) continue
+                val buildRoot = included.projectDir
+                // Walk the included build looking for build/libs directories with artifacts
+                buildRoot.walkTopDown()
+                    .maxDepth(6)
+                    .filter { it.isDirectory && it.name == "libs" && it.parentFile.name == "build" }
+                    .filter { libsDir ->
+                        // Only include if it actually has scannable artifacts
+                        DepscanScanTask.pickArtifact(libsDir) != null
+                    }
+                    .forEach { libsDir ->
+                        val subprojectName = libsDir.parentFile.parentFile?.name ?: included.name
+                        if (subprojectName !in excludes) {
+                            dirs.add(libsDir.absolutePath)
+                        }
+                    }
             }
+            project.logger.lifecycle("Composite build: discovered ${dirs.size} artifact directories across ${project.gradle.includedBuilds.size} included builds")
+            return dirs
         }
     }
 }
