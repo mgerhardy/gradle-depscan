@@ -56,6 +56,11 @@ abstract class DepscanReachabilityTask @Inject constructor(
     @get:Input
     abstract val artifactDirs: ListProperty<String>
 
+    /** Directory containing generated lock files (from DepscanLockGradleTask). */
+    @get:Optional
+    @get:Input
+    abstract val lockFilesDir: Property<String>
+
     /** Transient -- set by plugin, not serialized. Used to resolve runtime deps. */
     @get:org.gradle.api.tasks.Internal
     abstract val javaProjects: ListProperty<Project>
@@ -66,16 +71,96 @@ abstract class DepscanReachabilityTask @Inject constructor(
         val reports = reportsDir.get().asFile
         reports.mkdirs()
 
-        val artifacts = findArtifacts()
-        if (artifacts.isEmpty()) {
-            logger.warn("No scannable artifacts found.")
-            logger.warn("In a composite build, run: ./gradlew assemble depscanReachability")
-            return
-        }
-
         val env = buildEnvironment()
         val csafFiles = mutableListOf<File>()
         val slurper = JsonSlurper()
+
+        // Determine scan mode: lock-file based or artifact-based
+        val lockDir = if (lockFilesDir.isPresent) File(lockFilesDir.get()) else null
+        val hasLockFiles = lockDir != null && lockDir.exists() &&
+            lockDir.walkTopDown().any { it.name == "gradle.lockfile" }
+
+        if (hasLockFiles) {
+            logger.lifecycle("Using lock-file based scanning (no compilation needed)")
+            scanFromLockFiles(lockDir, binary, env, reports, csafFiles, slurper)
+        } else {
+            logger.lifecycle("Using artifact-based scanning (requires pre-built artifacts)")
+            scanFromArtifacts(binary, env, reports, csafFiles, slurper)
+        }
+
+        if (csafFiles.isEmpty()) {
+            logger.warn("No CSAF reports produced. Ensure dependencies are resolved or projects are built.")
+            return
+        }
+
+        // Collect runtime deps for test-scope filtering
+        val runtimeDeps = if (!includeTestDependencies.get()) {
+            if (javaProjects.isPresent && javaProjects.get().isNotEmpty()) {
+                RuntimeDependencyResolver.collectRuntimeDeps(javaProjects.get(), logger)
+            } else if (hasLockFiles) {
+                // Lock files already contain only runtime deps per configuration
+                // so filtering is less critical, but we can still extract them
+                RuntimeDependencyResolver.collectRuntimeDepsFromLockFiles(lockDir, logger)
+            } else {
+                val deps = RuntimeDependencyResolver.collectRuntimeDepsFromFiles(artifactDirs.get(), logger)
+                deps.ifEmpty { null }
+            }
+        } else {
+            null
+        }
+
+        // Merge reports
+        val mergedReport = File(reports, "depscan-merged-reachability.csaf.json")
+        CsafReportMerger.merge(csafFiles, mergedReport, runtimeDeps, logger)
+        logger.lifecycle("Merged report: ${mergedReport.absolutePath}")
+    }
+
+    /**
+     * Scan using generated lock files.  Depscan is pointed at each project
+     * directory that contains a gradle.lockfile -- cdxgen reads the lock file
+     * to build the SBOM, so no compiled artifacts are needed.
+     */
+    private fun scanFromLockFiles(
+        lockDir: File,
+        binary: String,
+        env: Map<String, String>,
+        reports: File,
+        csafFiles: MutableList<File>,
+        slurper: JsonSlurper
+    ) {
+        val lockFiles = lockDir.walkTopDown()
+            .filter { it.name == "gradle.lockfile" }
+            .toList()
+
+        logger.lifecycle("Found ${lockFiles.size} lock files to scan")
+
+        for (lockFile in lockFiles) {
+            val projectDir = lockFile.parentFile
+            val projectName = projectDir.relativeTo(lockDir).path.replace(File.separator, "-")
+                .ifEmpty { "root" }
+
+            logger.lifecycle("[$projectName] Scanning from lock file...")
+            runDepscanOnDirectory(projectDir, projectName, binary, env, reports, csafFiles, slurper)
+        }
+    }
+
+    /**
+     * Original artifact-based scanning path -- walks build/libs/ directories
+     * for JARs/WARs.
+     */
+    private fun scanFromArtifacts(
+        binary: String,
+        env: Map<String, String>,
+        reports: File,
+        csafFiles: MutableList<File>,
+        slurper: JsonSlurper
+    ) {
+        val artifacts = findArtifacts()
+        if (artifacts.isEmpty()) {
+            logger.warn("No scannable artifacts found.")
+            logger.warn("Run with lock files: ./gradlew depscanLockGradle depscanReachability")
+            return
+        }
 
         for ((projectName, artifactFile) in artifacts) {
             logger.lifecycle("[$projectName] Analyzing ${artifactFile.name}...")
@@ -101,86 +186,129 @@ abstract class DepscanReachabilityTask @Inject constructor(
                     logger.warn("[$projectName] BOM generation exited with code ${bomResult.exitValue}")
                 }
 
-                val bomFile = bomDir.listFiles()?.firstOrNull { it.name.startsWith("sbom") && it.name.endsWith(".cdx.json") }
+                val bomFile = bomDir.listFiles()?.firstOrNull {
+                    it.name.startsWith("sbom") && it.name.endsWith(".cdx.json")
+                }
                 if (bomFile == null) {
                     logger.warn("[$projectName] No BOM generated, skipping")
                     continue
                 }
 
-                // Step 2: Patch lifecycle to post-build
-                val pbDir = File.createTempFile("depscan-pb-$projectName-", "").apply { delete(); mkdirs() }
-                try {
-                    @Suppress("UNCHECKED_CAST")
-                    val bomData = slurper.parseText(bomFile.readText()) as MutableMap<String, Any?>
-                    @Suppress("UNCHECKED_CAST")
-                    val metadata = bomData.getOrPut("metadata") { mutableMapOf<String, Any?>() } as MutableMap<String, Any?>
-                    metadata["lifecycles"] = listOf(mapOf("phase" to "post-build"))
-                    val patchedBom = File(pbDir, bomFile.name.replace("sbom-", "sbom-postbuild-"))
-                    patchedBom.writeText(JsonOutput.toJson(bomData))
-
-                    // Step 3: Run reachability analysis
-                    val resultsDir = File(reports, projectName)
-                    resultsDir.mkdirs()
-                    val reachArgs = mutableListOf(
-                        binary,
-                        "--profile", profile.get(),
-                        "--reachability-analyzer", reachabilityAnalyzer.get(),
-                        "--csaf",
-                        "-t", targetType.get(),
-                        "--bom-dir", pbDir.absolutePath,
-                        "--reports-dir", resultsDir.absolutePath,
-                        "--vdb-scope", vdbScope.get(),
-                        "--no-banner"
-                    )
-                    reachArgs.addAll(additionalArgs.get())
-
-                    val reachResult = execOps.exec { spec ->
-                        spec.commandLine(reachArgs)
-                        spec.environment(env)
-                        spec.isIgnoreExitValue = true
-                    }
-                    if (reachResult.exitValue != 0) {
-                        logger.warn("[$projectName] Reachability analysis exited with code ${reachResult.exitValue}")
-                    }
-
-                    val csafFile = resultsDir.listFiles()?.firstOrNull { it.name.endsWith(".csaf.json") }
-                    if (csafFile != null) {
-                        csafFiles.add(csafFile)
-                        logger.lifecycle("[$projectName] CSAF report generated: ${csafFile.name}")
-                    } else {
-                        logger.warn("[$projectName] No CSAF output produced")
-                    }
-                } finally {
-                    pbDir.deleteRecursively()
-                }
+                runReachabilityAnalysis(projectName, bomFile, binary, env, reports, csafFiles, slurper)
             } finally {
                 bomDir.deleteRecursively()
             }
         }
+    }
 
-        if (csafFiles.isEmpty()) {
-            logger.warn("No CSAF reports produced. Ensure projects are built and depscan is working.")
-            return
-        }
-
-        // Step 4: Collect runtime deps for test-scope filtering
-        val runtimeDeps = if (!includeTestDependencies.get()) {
-            if (javaProjects.isPresent && javaProjects.get().isNotEmpty()) {
-                // Regular multi-project build: resolve directly from Project objects
-                RuntimeDependencyResolver.collectRuntimeDeps(javaProjects.get(), logger)
-            } else {
-                // Composite build: resolve from runtime-deps.txt files
-                val deps = RuntimeDependencyResolver.collectRuntimeDepsFromFiles(artifactDirs.get(), logger)
-                deps.ifEmpty { null }
+    /**
+     * Runs depscan against a directory containing a gradle.lockfile.
+     * Depscan (via cdxgen) will read the lock file to produce the SBOM.
+     */
+    private fun runDepscanOnDirectory(
+        projectDir: File,
+        projectName: String,
+        binary: String,
+        env: Map<String, String>,
+        reports: File,
+        csafFiles: MutableList<File>,
+        slurper: JsonSlurper
+    ) {
+        // Step 1: Generate BOM from the directory (cdxgen reads gradle.lockfile)
+        val bomDir = File.createTempFile("depscan-bom-$projectName-", "").apply { delete(); mkdirs() }
+        try {
+            val bomArgs = mutableListOf(
+                binary,
+                "-t", targetType.get(),
+                "-i", projectDir.absolutePath,
+                "--reports-dir", bomDir.absolutePath,
+                "--vdb-scope", vdbScope.get(),
+                "--no-banner",
+                "--no-vuln-table"
+            )
+            val bomResult = execOps.exec { spec ->
+                spec.commandLine(bomArgs)
+                spec.environment(env)
+                spec.isIgnoreExitValue = true
             }
-        } else {
-            null
-        }
+            if (bomResult.exitValue != 0) {
+                logger.warn("[$projectName] BOM generation exited with code ${bomResult.exitValue}")
+            }
 
-        // Step 5: Merge reports
-        val mergedReport = File(reports, "depscan-merged-reachability.csaf.json")
-        CsafReportMerger.merge(csafFiles, mergedReport, runtimeDeps, logger)
-        logger.lifecycle("Merged report: ${mergedReport.absolutePath}")
+            val bomFile = bomDir.listFiles()?.firstOrNull {
+                it.name.startsWith("sbom") && it.name.endsWith(".cdx.json")
+            }
+            if (bomFile == null) {
+                logger.warn("[$projectName] No BOM generated, skipping")
+                return
+            }
+
+            runReachabilityAnalysis(projectName, bomFile, binary, env, reports, csafFiles, slurper)
+        } finally {
+            bomDir.deleteRecursively()
+        }
+    }
+
+    /**
+     * Common reachability analysis: patches BOM lifecycle, runs depscan
+     * reachability, collects CSAF output.
+     */
+    private fun runReachabilityAnalysis(
+        projectName: String,
+        bomFile: File,
+        binary: String,
+        env: Map<String, String>,
+        reports: File,
+        csafFiles: MutableList<File>,
+        slurper: JsonSlurper
+    ) {
+        // Patch lifecycle to post-build
+        val pbDir = File.createTempFile("depscan-pb-$projectName-", "").apply { delete(); mkdirs() }
+        try {
+            @Suppress("UNCHECKED_CAST")
+            val bomData = slurper.parseText(bomFile.readText()) as MutableMap<String, Any?>
+            @Suppress("UNCHECKED_CAST")
+            val metadata = bomData.getOrPut("metadata") { mutableMapOf<String, Any?>() }
+                as MutableMap<String, Any?>
+            metadata["lifecycles"] = listOf(mapOf("phase" to "post-build"))
+            val patchedBom = File(pbDir, bomFile.name.replace("sbom-", "sbom-postbuild-"))
+            patchedBom.writeText(JsonOutput.toJson(bomData))
+
+            // Run reachability analysis
+            val resultsDir = File(reports, projectName)
+            resultsDir.mkdirs()
+            val reachArgs = mutableListOf(
+                binary,
+                "--profile", profile.get(),
+                "--reachability-analyzer", reachabilityAnalyzer.get(),
+                "--csaf",
+                "-t", targetType.get(),
+                "--bom-dir", pbDir.absolutePath,
+                "--reports-dir", resultsDir.absolutePath,
+                "--vdb-scope", vdbScope.get(),
+                "--no-banner"
+            )
+            reachArgs.addAll(additionalArgs.get())
+
+            val reachResult = execOps.exec { spec ->
+                spec.commandLine(reachArgs)
+                spec.environment(env)
+                spec.isIgnoreExitValue = true
+            }
+            if (reachResult.exitValue != 0) {
+                logger.warn("[$projectName] Reachability analysis exited with code ${reachResult.exitValue}")
+            }
+
+            val csafFile = resultsDir.listFiles()?.firstOrNull { it.name.endsWith(".csaf.json") }
+            if (csafFile != null) {
+                csafFiles.add(csafFile)
+                logger.lifecycle("[$projectName] CSAF report generated: ${csafFile.name}")
+            } else {
+                logger.warn("[$projectName] No CSAF output produced")
+            }
+        } finally {
+            pbDir.deleteRecursively()
+        }
     }
 
     private fun findArtifacts(): List<Pair<String, File>> {

@@ -30,6 +30,10 @@ abstract class DepscanExtension {
     // Project filtering
     abstract val excludeProjects: ListProperty<String>
 
+    // Lock file generation
+    abstract val maxParallelLocks: Property<Int>
+    abstract val perProjectTimeoutSeconds: Property<Long>
+
     init {
         version.convention("6.3.0")
         targetType.convention("java")
@@ -40,5 +44,7 @@ abstract class DepscanExtension {
         additionalScanArgs.convention(emptyList())
         additionalReachabilityArgs.convention(emptyList())
         excludeProjects.convention(emptyList())
+        maxParallelLocks.convention(4)
+        perProjectTimeoutSeconds.convention(300L)
     }
 }

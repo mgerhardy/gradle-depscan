@@ -1,7 +1,6 @@
 package io.github.mgerhardy.depscan
 
 import org.gradle.api.DefaultTask
-import org.gradle.api.GradleException
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.provider.ListProperty
@@ -45,20 +44,80 @@ abstract class DepscanScanTask @Inject constructor(
     @get:Input
     abstract val artifactDirs: ListProperty<String>
 
+    /** Directory containing generated lock files (from DepscanLockGradleTask). */
+    @get:Optional
+    @get:Input
+    abstract val lockFilesDir: Property<String>
+
     @TaskAction
     fun scan() {
         val binary = depscanBinary.get().asFile.absolutePath
         val reports = reportsDir.get().asFile
         reports.mkdirs()
 
-        val artifacts = findArtifacts()
-        if (artifacts.isEmpty()) {
-            logger.warn("No scannable artifacts found in any subproject build/libs/ directory.")
-            logger.warn("In a composite build, run: ./gradlew assemble depscanScan")
-            return
+        val env = buildEnvironment()
+
+        // Prefer lock-file scanning if available
+        val lockDir = if (lockFilesDir.isPresent) File(lockFilesDir.get()) else null
+        val hasLockFiles = lockDir != null && lockDir.exists() &&
+            lockDir.walkTopDown().any { it.name == "gradle.lockfile" }
+
+        if (hasLockFiles) {
+            logger.lifecycle("Scanning from lock files (no compilation needed)")
+            scanFromLockFiles(lockDir, binary, env, reports)
+        } else {
+            logger.lifecycle("Scanning from built artifacts")
+            scanFromArtifacts(binary, env, reports)
         }
 
-        val env = buildEnvironment()
+        logger.lifecycle("Scan reports written to ${reports.absolutePath}")
+    }
+
+    private fun scanFromLockFiles(lockDir: File, binary: String, env: Map<String, String>, reports: File) {
+        val lockFiles = lockDir.walkTopDown()
+            .filter { it.name == "gradle.lockfile" }
+            .toList()
+
+        logger.lifecycle("Found ${lockFiles.size} lock files to scan")
+
+        for (lockFile in lockFiles) {
+            val projectDir = lockFile.parentFile
+            val projectName = projectDir.relativeTo(lockDir).path.replace(File.separator, "-")
+                .ifEmpty { "root" }
+
+            val projectReportsDir = File(reports, projectName)
+            projectReportsDir.mkdirs()
+
+            logger.lifecycle("Scanning $projectName from lock file")
+            val args = mutableListOf(
+                binary,
+                "-t", targetType.get(),
+                "-i", projectDir.absolutePath,
+                "--reports-dir", projectReportsDir.absolutePath,
+                "--vdb-scope", vdbScope.get(),
+                "--no-banner",
+                "--no-vuln-table"
+            )
+            args.addAll(additionalArgs.get())
+
+            val result = execOps.exec { spec ->
+                spec.commandLine(args)
+                spec.environment(env)
+                spec.isIgnoreExitValue = true
+            }
+            if (result.exitValue != 0) {
+                logger.warn("depscan scan for $projectName exited with code ${result.exitValue}")
+            }
+        }
+    }
+
+    private fun scanFromArtifacts(binary: String, env: Map<String, String>, reports: File) {
+        val artifacts = findArtifacts()
+        if (artifacts.isEmpty()) {
+            logger.warn("No scannable artifacts or lock files found.")
+            logger.warn("Run: ./gradlew depscanLockGradle depscanScan")
+            return
+        }
 
         for ((projectName, artifactFile) in artifacts) {
             val projectReportsDir = File(reports, projectName)
@@ -85,7 +144,6 @@ abstract class DepscanScanTask @Inject constructor(
                 logger.warn("depscan scan for $projectName exited with code ${result.exitValue}")
             }
         }
-        logger.lifecycle("Scan reports written to ${reports.absolutePath}")
     }
 
     private fun findArtifacts(): List<Pair<String, File>> {
@@ -119,7 +177,6 @@ abstract class DepscanScanTask @Inject constructor(
                     !f.name.endsWith("-javadoc.jar") &&
                     !f.name.endsWith("-plain.jar")
             }
-            // Prefer boot WARs/JARs
             return candidates.firstOrNull { it.name.contains("-boot") || it.name.contains("-all") }
                 ?: candidates.firstOrNull { it.extension == "war" }
                 ?: candidates.firstOrNull()

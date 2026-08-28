@@ -19,6 +19,7 @@ class DepscanPluginFunctionalTest {
             .build()
 
         assertTrue(result.output.contains("depscanDownload"))
+        assertTrue(result.output.contains("depscanLockGradle"))
         assertTrue(result.output.contains("depscanScan"))
         assertTrue(result.output.contains("depscanReachability"))
         assertTrue(result.output.contains("depscanFullScan"))
@@ -112,6 +113,64 @@ class DepscanPluginFunctionalTest {
 
         assertTrue(result.output.contains(":depscanReachability"))
         assertTrue(result.output.contains(":depscanFullScan"))
+    }
+
+    @Test
+    fun `depscanLockGradle generates lock files for java project`() {
+        // Create a separate target project that the lock task will scan
+        // This project only needs standard plugins - no depscan plugin
+        val targetDir = File.createTempFile("depscan-target", "").apply { delete(); mkdirs() }
+        targetDir.deleteOnExit()
+        File(targetDir, "settings.gradle").writeText("rootProject.name = 'target-project'")
+        File(targetDir, "build.gradle").writeText("""
+            plugins { id 'java' }
+            repositories { mavenCentral() }
+            dependencies { implementation 'com.google.guava:guava:33.4.8-jre' }
+        """.trimIndent())
+        // Provision gradle wrapper
+        val ownWrapper = File(System.getProperty("user.dir"), "gradle/wrapper")
+        val targetWrapper = File(targetDir, "gradle/wrapper")
+        targetWrapper.mkdirs()
+        File(ownWrapper, "gradle-wrapper.jar").copyTo(File(targetWrapper, "gradle-wrapper.jar"))
+        File(ownWrapper, "gradle-wrapper.properties").copyTo(File(targetWrapper, "gradle-wrapper.properties"))
+        File(System.getProperty("user.dir"), "gradlew").copyTo(File(targetDir, "gradlew")).setExecutable(true)
+
+        // Create the depscan plugin project that points scanTarget at the target
+        val projectDir = createTempProject("""
+            depscan {
+                // not needed but avoids warnings
+            }
+            tasks.named<io.github.mgerhardy.depscan.DepscanLockGradleTask>("depscanLockGradle") {
+                scanTarget.set(file("${targetDir.absolutePath.replace("\\", "\\\\")}"))
+            }
+        """.trimIndent())
+
+        val result = GradleRunner.create()
+            .withProjectDir(projectDir)
+            .withPluginClasspath()
+            .withArguments("depscanLockGradle", "--stacktrace")
+            .build()
+
+        assertEquals(TaskOutcome.SUCCESS, result.task(":depscanLockGradle")?.outcome)
+        val lockDir = File(projectDir, "build/depscan-locks/gradle")
+        assertTrue(lockDir.exists(), "Lock directory should exist")
+        val lockFiles = lockDir.walkTopDown().filter { it.name == "gradle.lockfile" }.toList()
+        assertTrue(lockFiles.isNotEmpty(), "At least one lock file should be generated: ${result.output}")
+        val content = lockFiles.first().readText()
+        assertTrue(content.contains("com.google.guava:guava"), "Lock file should contain guava dependency")
+    }
+
+    @Test
+    fun `depscanReachability depends on depscanLockGradle`() {
+        val projectDir = createTempProject()
+        val result = GradleRunner.create()
+            .withProjectDir(projectDir)
+            .withPluginClasspath()
+            .withArguments("depscanReachability", "--dry-run")
+            .build()
+
+        assertTrue(result.output.contains(":depscanLockGradle"))
+        assertTrue(result.output.contains(":depscanReachability"))
     }
 
     private fun createTempProject(extraConfig: String = ""): File {

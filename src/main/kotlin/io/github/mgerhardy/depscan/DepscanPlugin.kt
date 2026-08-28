@@ -36,6 +36,7 @@ class DepscanPlugin : Plugin<Project> {
         }
 
         // Collect artifact directories -- supports both regular and composite builds
+        // (used as fallback when lock files are not available)
         val artifactDirs = if (isCompositeBuild) {
             project.provider {
                 val excludes = extension.excludeProjects.get().toSet()
@@ -49,6 +50,17 @@ class DepscanPlugin : Plugin<Project> {
             }
         }
 
+        // Lock file output directory
+        val lockOutputDir = project.layout.buildDirectory.dir("depscan-locks/gradle")
+
+        // Determine scan target for lock file generation
+        val scanTargetDir = if (isCompositeBuild) {
+            // For composite builds, scan from the project directory
+            project.layout.projectDirectory
+        } else {
+            project.layout.projectDirectory
+        }
+
         // Register tasks
         val downloadTask = project.tasks.register("depscanDownload", DepscanDownloadTask::class.java) {
             it.group = "depscan"
@@ -59,10 +71,37 @@ class DepscanPlugin : Plugin<Project> {
             it.onlyIf { !extension.binaryPath.isPresent }
         }
 
+        // Lock file generation task (no compilation needed)
+        val lockTask = project.tasks.register("depscanLockGradle", DepscanLockGradleTask::class.java) {
+            it.group = "depscan"
+            it.description = "Generates Gradle dependency lock files for vulnerability scanning (no compilation needed)"
+            it.scanTarget.set(scanTargetDir)
+            it.outputDir.set(lockOutputDir)
+            it.maxParallelLocks.set(extension.maxParallelLocks)
+            it.excludeProjects.set(extension.excludeProjects)
+            it.perProjectTimeoutSeconds.set(extension.perProjectTimeoutSeconds)
+            // Narrowed inputs: only build script files
+            it.buildScriptFiles.from(
+                project.provider {
+                    project.fileTree(scanTargetDir) { tree ->
+                        tree.include(
+                            "**/settings.gradle", "**/settings.gradle.kts",
+                            "**/build.gradle", "**/build.gradle.kts",
+                            "**/gradle.properties", "**/libs.versions.toml"
+                        )
+                        tree.exclude(
+                            "**/node_modules/**", "**/build/**",
+                            "**/.git/**", "**/.gradle/**"
+                        )
+                    }
+                }
+            )
+        }
+
         val scanTask = project.tasks.register("depscanScan", DepscanScanTask::class.java) {
             it.group = "depscan"
-            it.description = "Runs depscan vulnerability scan on built artifacts"
-            it.dependsOn(downloadTask)
+            it.description = "Runs depscan vulnerability scan"
+            it.dependsOn(downloadTask, lockTask)
             it.depscanBinary.set(effectiveBinary)
             it.targetType.set(extension.targetType)
             it.vdbScope.set(extension.vdbScope)
@@ -70,12 +109,13 @@ class DepscanPlugin : Plugin<Project> {
             it.reportsDir.set(extension.reportsDir)
             it.vdbHome.set(extension.vdbHome.map { it.asFile.absolutePath })
             it.artifactDirs.set(artifactDirs)
+            it.lockFilesDir.set(lockOutputDir.map { it.asFile.absolutePath })
         }
 
         val reachabilityTask = project.tasks.register("depscanReachability", DepscanReachabilityTask::class.java) {
             it.group = "depscan"
-            it.description = "Runs depscan reachability analysis on built artifacts"
-            it.dependsOn(downloadTask)
+            it.description = "Runs depscan reachability analysis"
+            it.dependsOn(downloadTask, lockTask)
             it.depscanBinary.set(effectiveBinary)
             it.targetType.set(extension.targetType)
             it.profile.set(extension.profile)
@@ -86,7 +126,8 @@ class DepscanPlugin : Plugin<Project> {
             it.reportsDir.set(extension.reportsDir)
             it.vdbHome.set(extension.vdbHome.map { it.asFile.absolutePath })
             it.artifactDirs.set(artifactDirs)
-            // Only set javaProjects for non-composite builds (composite uses file-based resolution)
+            it.lockFilesDir.set(lockOutputDir.map { it.asFile.absolutePath })
+            // Only set javaProjects for non-composite builds
             if (!isCompositeBuild) {
                 it.javaProjects.set(javaSubprojects)
             }
@@ -98,23 +139,21 @@ class DepscanPlugin : Plugin<Project> {
             it.dependsOn(reachabilityTask)
         }
 
-        // Wire assemble dependencies
-        if (isCompositeBuild) {
-            // Composite build: no task dependency on included builds' assemble.
-            // Gradle does not support dependsOn or shouldRunAfter across the
-            // composite boundary. The scan tasks simply scan whatever artifacts
-            // are already built on disk. In CI, assemble runs before depscan
-            // as a separate Gradle invocation.
-            project.logger.info("Depscan: composite build detected -- scan will use pre-built artifacts")
-        } else {
-            // Regular build: depend on subproject assemble tasks
+        // For non-composite builds without lock files, fall back to assemble
+        if (!isCompositeBuild) {
             project.afterEvaluate {
                 val assembleTasks = javaSubprojects.get().mapNotNull { sub ->
                     sub.tasks.findByName("assemble")
                 }
                 if (assembleTasks.isNotEmpty()) {
-                    scanTask.configure { task -> assembleTasks.forEach { task.dependsOn(it) } }
-                    reachabilityTask.configure { task -> assembleTasks.forEach { task.dependsOn(it) } }
+                    // assemble is only needed if lock task is skipped
+                    // The scan tasks prefer lock files when available
+                    scanTask.configure { task ->
+                        task.mustRunAfter(assembleTasks)
+                    }
+                    reachabilityTask.configure { task ->
+                        task.mustRunAfter(assembleTasks)
+                    }
                 }
             }
         }
@@ -123,21 +162,17 @@ class DepscanPlugin : Plugin<Project> {
     companion object {
         /**
          * Discovers build/libs directories across all included builds in a composite.
-         *
-         * Walks each included build's project directory looking for build/libs/ directories
-         * that contain scannable artifacts (boot WARs, JARs).
+         * Used as fallback when lock files are not available.
          */
         fun discoverCompositeBuildArtifactDirs(project: Project, excludes: Set<String>): List<String> {
             val dirs = mutableListOf<String>()
             for (included in project.gradle.includedBuilds) {
                 if (included.name in excludes) continue
                 val buildRoot = included.projectDir
-                // Walk the included build looking for build/libs directories with artifacts
                 buildRoot.walkTopDown()
                     .maxDepth(6)
                     .filter { it.isDirectory && it.name == "libs" && it.parentFile.name == "build" }
                     .filter { libsDir ->
-                        // Only include if it actually has scannable artifacts
                         DepscanScanTask.pickArtifact(libsDir) != null
                     }
                     .forEach { libsDir ->
@@ -147,7 +182,10 @@ class DepscanPlugin : Plugin<Project> {
                         }
                     }
             }
-            project.logger.lifecycle("Composite build: discovered ${dirs.size} artifact directories across ${project.gradle.includedBuilds.size} included builds")
+            project.logger.lifecycle(
+                "Composite build: discovered ${dirs.size} artifact directories " +
+                    "across ${project.gradle.includedBuilds.size} included builds"
+            )
             return dirs
         }
     }
