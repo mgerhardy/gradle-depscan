@@ -116,9 +116,10 @@ abstract class DepscanReachabilityTask @Inject constructor(
     }
 
     /**
-     * Scan using generated lock files.  Depscan is pointed at each project
-     * directory that contains a gradle.lockfile -- cdxgen reads the lock file
-     * to build the SBOM, so no compiled artifacts are needed.
+     * Scan using generated lock files.  We generate CycloneDX BOMs directly
+     * from the lock file content (bypassing cdxgen which cannot read bare
+     * gradle.lockfile without a build.gradle) and pass each BOM to depscan
+     * via --bom-dir for reachability analysis.
      */
     private fun scanFromLockFiles(
         lockDir: File,
@@ -128,19 +129,16 @@ abstract class DepscanReachabilityTask @Inject constructor(
         csafFiles: MutableList<File>,
         slurper: JsonSlurper
     ) {
-        val lockFiles = lockDir.walkTopDown()
-            .filter { it.name == "gradle.lockfile" }
-            .toList()
+        val bomFiles = LockFileBomGenerator.generateBomsFromLockDir(lockDir)
+        logger.lifecycle("Generated ${bomFiles.size} BOMs from lock files")
 
-        logger.lifecycle("Found ${lockFiles.size} lock files to scan")
-
-        for (lockFile in lockFiles) {
-            val projectDir = lockFile.parentFile
-            val projectName = projectDir.relativeTo(lockDir).path.replace(File.separator, "-")
+        for (bomFile in bomFiles) {
+            val projectName = bomFile.parentFile.relativeTo(lockDir).path
+                .replace(File.separator, "-")
                 .ifEmpty { "root" }
 
-            logger.lifecycle("[$projectName] Scanning from lock file...")
-            runDepscanOnDirectory(projectDir, projectName, binary, env, reports, csafFiles, slurper)
+            logger.lifecycle("[$projectName] Running reachability analysis (${bomFile.length() / 1024}KB BOM)...")
+            runReachabilityAnalysis(projectName, bomFile, binary, env, reports, csafFiles, slurper)
         }
     }
 
@@ -202,55 +200,7 @@ abstract class DepscanReachabilityTask @Inject constructor(
     }
 
     /**
-     * Runs depscan against a directory containing a gradle.lockfile.
-     * Depscan (via cdxgen) will read the lock file to produce the SBOM.
-     */
-    private fun runDepscanOnDirectory(
-        projectDir: File,
-        projectName: String,
-        binary: String,
-        env: Map<String, String>,
-        reports: File,
-        csafFiles: MutableList<File>,
-        slurper: JsonSlurper
-    ) {
-        // Step 1: Generate BOM from the directory (cdxgen reads gradle.lockfile)
-        val bomDir = File.createTempFile("depscan-bom-$projectName-", "").apply { delete(); mkdirs() }
-        try {
-            val bomArgs = mutableListOf(
-                binary,
-                "-t", targetType.get(),
-                "-i", projectDir.absolutePath,
-                "--reports-dir", bomDir.absolutePath,
-                "--vdb-scope", vdbScope.get(),
-                "--no-banner",
-                "--no-vuln-table"
-            )
-            val bomResult = execOps.exec { spec ->
-                spec.commandLine(bomArgs)
-                spec.environment(env)
-                spec.isIgnoreExitValue = true
-            }
-            if (bomResult.exitValue != 0) {
-                logger.warn("[$projectName] BOM generation exited with code ${bomResult.exitValue}")
-            }
-
-            val bomFile = bomDir.listFiles()?.firstOrNull {
-                it.name.startsWith("sbom") && it.name.endsWith(".cdx.json")
-            }
-            if (bomFile == null) {
-                logger.warn("[$projectName] No BOM generated, skipping")
-                return
-            }
-
-            runReachabilityAnalysis(projectName, bomFile, binary, env, reports, csafFiles, slurper)
-        } finally {
-            bomDir.deleteRecursively()
-        }
-    }
-
-    /**
-     * Common reachability analysis: patches BOM lifecycle, runs depscan
+     * Common reachability analysis: patches BOM lifecycle if needed, runs depscan
      * reachability, collects CSAF output.
      */
     private fun runReachabilityAnalysis(

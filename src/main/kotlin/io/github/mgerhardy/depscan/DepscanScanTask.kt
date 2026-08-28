@@ -74,25 +74,23 @@ abstract class DepscanScanTask @Inject constructor(
     }
 
     private fun scanFromLockFiles(lockDir: File, binary: String, env: Map<String, String>, reports: File) {
-        val lockFiles = lockDir.walkTopDown()
-            .filter { it.name == "gradle.lockfile" }
-            .toList()
+        val bomFiles = LockFileBomGenerator.generateBomsFromLockDir(lockDir)
+        logger.lifecycle("Generated ${bomFiles.size} BOMs from lock files")
 
-        logger.lifecycle("Found ${lockFiles.size} lock files to scan")
-
-        for (lockFile in lockFiles) {
-            val projectDir = lockFile.parentFile
-            val projectName = projectDir.relativeTo(lockDir).path.replace(File.separator, "-")
+        for (bomFile in bomFiles) {
+            val projectName = bomFile.parentFile.relativeTo(lockDir).path
+                .replace(File.separator, "-")
                 .ifEmpty { "root" }
 
             val projectReportsDir = File(reports, projectName)
             projectReportsDir.mkdirs()
 
-            logger.lifecycle("Scanning $projectName from lock file")
+            // Run depscan with --bom pointing at the generated BOM
+            logger.lifecycle("Scanning $projectName (${bomFile.length() / 1024}KB BOM)")
             val args = mutableListOf(
                 binary,
                 "-t", targetType.get(),
-                "-i", projectDir.absolutePath,
+                "--bom", bomFile.absolutePath,
                 "--reports-dir", projectReportsDir.absolutePath,
                 "--vdb-scope", vdbScope.get(),
                 "--no-banner",
