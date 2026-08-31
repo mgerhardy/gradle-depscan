@@ -179,6 +179,7 @@ abstract class DepscanReachabilityTask @Inject constructor(
                     spec.commandLine(bomArgs)
                     spec.environment(env)
                     spec.isIgnoreExitValue = true
+                    spec.standardOutput = java.io.OutputStream.nullOutputStream()
                 }
                 if (bomResult.exitValue != 0) {
                     logger.warn("[$projectName] BOM generation exited with code ${bomResult.exitValue}")
@@ -236,7 +237,8 @@ abstract class DepscanReachabilityTask @Inject constructor(
                 "--bom-dir", pbDir.absolutePath,
                 "--reports-dir", resultsDir.absolutePath,
                 "--vdb-scope", vdbScope.get(),
-                "--no-banner"
+                "--no-banner",
+                "--no-vuln-table"
             )
             reachArgs.addAll(additionalArgs.get())
 
@@ -244,6 +246,7 @@ abstract class DepscanReachabilityTask @Inject constructor(
                 spec.commandLine(reachArgs)
                 spec.environment(env)
                 spec.isIgnoreExitValue = true
+                spec.standardOutput = java.io.OutputStream.nullOutputStream()
             }
             if (reachResult.exitValue != 0) {
                 logger.warn("[$projectName] Reachability analysis exited with code ${reachResult.exitValue}")

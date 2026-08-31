@@ -102,6 +102,7 @@ abstract class DepscanScanTask @Inject constructor(
                 spec.commandLine(args)
                 spec.environment(env)
                 spec.isIgnoreExitValue = true
+                spec.standardOutput = java.io.OutputStream.nullOutputStream()
             }
             if (result.exitValue != 0) {
                 logger.warn("depscan scan for $projectName exited with code ${result.exitValue}")
@@ -137,6 +138,7 @@ abstract class DepscanScanTask @Inject constructor(
                 spec.commandLine(args)
                 spec.environment(env)
                 spec.isIgnoreExitValue = true
+                spec.standardOutput = java.io.OutputStream.nullOutputStream()
             }
             if (result.exitValue != 0) {
                 logger.warn("depscan scan for $projectName exited with code ${result.exitValue}")
