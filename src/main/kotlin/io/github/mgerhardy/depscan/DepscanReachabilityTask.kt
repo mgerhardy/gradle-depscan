@@ -175,14 +175,20 @@ abstract class DepscanReachabilityTask @Inject constructor(
                     "--no-banner",
                     "--no-vuln-table"
                 )
+                val bomStderr = java.io.ByteArrayOutputStream()
                 val bomResult = execOps.exec { spec ->
                     spec.commandLine(bomArgs)
                     spec.environment(env)
                     spec.isIgnoreExitValue = true
                     spec.standardOutput = java.io.OutputStream.nullOutputStream()
+                    spec.errorOutput = bomStderr
                 }
                 if (bomResult.exitValue != 0) {
-                    logger.warn("[$projectName] BOM generation exited with code ${bomResult.exitValue}")
+                    val stderr = bomStderr.toString().trim()
+                    logger.error("[$projectName] BOM generation failed with exit code ${bomResult.exitValue}")
+                    if (stderr.isNotEmpty()) {
+                        logger.error("[$projectName] $stderr")
+                    }
                 }
 
                 val bomFile = bomDir.listFiles()?.firstOrNull {
@@ -242,21 +248,27 @@ abstract class DepscanReachabilityTask @Inject constructor(
             )
             reachArgs.addAll(additionalArgs.get())
 
+            val stderrCapture = java.io.ByteArrayOutputStream()
             val reachResult = execOps.exec { spec ->
                 spec.commandLine(reachArgs)
                 spec.environment(env)
                 spec.isIgnoreExitValue = true
                 spec.standardOutput = java.io.OutputStream.nullOutputStream()
+                spec.errorOutput = stderrCapture
             }
             if (reachResult.exitValue != 0) {
-                logger.warn("[$projectName] Reachability analysis exited with code ${reachResult.exitValue}")
+                val stderr = stderrCapture.toString().trim()
+                logger.error("[$projectName] depscan failed with exit code ${reachResult.exitValue}")
+                if (stderr.isNotEmpty()) {
+                    logger.error("[$projectName] $stderr")
+                }
             }
 
             val csafFile = resultsDir.listFiles()?.firstOrNull { it.name.endsWith(".csaf.json") }
             if (csafFile != null) {
                 csafFiles.add(csafFile)
                 logger.lifecycle("[$projectName] CSAF report generated: ${csafFile.name}")
-            } else {
+            } else if (reachResult.exitValue == 0) {
                 logger.warn("[$projectName] No CSAF output produced")
             }
         } finally {

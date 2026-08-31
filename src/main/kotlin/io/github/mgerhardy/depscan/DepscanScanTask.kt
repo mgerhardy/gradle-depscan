@@ -98,14 +98,20 @@ abstract class DepscanScanTask @Inject constructor(
             )
             args.addAll(additionalArgs.get())
 
+            val stderrCapture = java.io.ByteArrayOutputStream()
             val result = execOps.exec { spec ->
                 spec.commandLine(args)
                 spec.environment(env)
                 spec.isIgnoreExitValue = true
                 spec.standardOutput = java.io.OutputStream.nullOutputStream()
+                spec.errorOutput = stderrCapture
             }
             if (result.exitValue != 0) {
-                logger.warn("depscan scan for $projectName exited with code ${result.exitValue}")
+                val stderr = stderrCapture.toString().trim()
+                logger.error("depscan scan for $projectName failed with exit code ${result.exitValue}")
+                if (stderr.isNotEmpty()) {
+                    logger.error("[$projectName] $stderr")
+                }
             }
         }
     }
@@ -134,14 +140,20 @@ abstract class DepscanScanTask @Inject constructor(
             )
             args.addAll(additionalArgs.get())
 
+            val artifactStderr = java.io.ByteArrayOutputStream()
             val result = execOps.exec { spec ->
                 spec.commandLine(args)
                 spec.environment(env)
                 spec.isIgnoreExitValue = true
                 spec.standardOutput = java.io.OutputStream.nullOutputStream()
+                spec.errorOutput = artifactStderr
             }
             if (result.exitValue != 0) {
-                logger.warn("depscan scan for $projectName exited with code ${result.exitValue}")
+                val stderr = artifactStderr.toString().trim()
+                logger.error("depscan scan for $projectName failed with exit code ${result.exitValue}")
+                if (stderr.isNotEmpty()) {
+                    logger.error("[$projectName] $stderr")
+                }
             }
         }
     }
